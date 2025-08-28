@@ -1,11 +1,12 @@
 cmake_minimum_required(VERSION 3.5)
+set(CMAKE_OSX_ARCHITECTURES arm64;x86_64)
 project(PortAudio VERSION 19.8)
 
 #
 # General PortAudio stuff
 #
 
-option(PA_BUILD_SHARED_LIBS "Build dynamic library" ${BUILD_SHARED_LIBS})
+option(PA_BUILD_SHARED_LIBS "Build dynamic library" ON)
 option(PA_BUILD_TESTS "Include test projects" OFF)
 option(PA_BUILD_EXAMPLES "Include example projects" OFF)
 

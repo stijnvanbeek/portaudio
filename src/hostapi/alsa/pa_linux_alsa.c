@@ -135,7 +135,7 @@ _PA_DEFINE_FUNC(snd_pcm_hw_params_set_channels);
 _PA_DEFINE_FUNC(snd_pcm_hw_params_set_rate_near); //!!!
 _PA_DEFINE_FUNC(snd_pcm_hw_params_set_rate);
 _PA_DEFINE_FUNC(snd_pcm_hw_params_set_rate_resample);
-//_PA_DEFINE_FUNC(snd_pcm_hw_params_set_buffer_time_near);
+_PA_DEFINE_FUNC(snd_pcm_hw_params_set_buffer_time_near);
 _PA_DEFINE_FUNC(snd_pcm_hw_params_set_buffer_size);
 _PA_DEFINE_FUNC(snd_pcm_hw_params_set_buffer_size_near); //!!!
 _PA_DEFINE_FUNC(snd_pcm_hw_params_set_buffer_size_min);
@@ -420,7 +420,7 @@ static int PaAlsa_LoadLibrary()
     _PA_LOAD_FUNC(snd_pcm_hw_params_set_rate_near);
     _PA_LOAD_FUNC(snd_pcm_hw_params_set_rate);
     _PA_LOAD_FUNC(snd_pcm_hw_params_set_rate_resample);
-//    _PA_LOAD_FUNC(snd_pcm_hw_params_set_buffer_time_near);
+    _PA_LOAD_FUNC(snd_pcm_hw_params_set_buffer_time_near);
     _PA_LOAD_FUNC(snd_pcm_hw_params_set_buffer_size);
     _PA_LOAD_FUNC(snd_pcm_hw_params_set_buffer_size_near);
     _PA_LOAD_FUNC(snd_pcm_hw_params_set_buffer_size_min);
@@ -912,12 +912,23 @@ static PaError GropeDevice( snd_pcm_t* pcm, int isPlug, StreamDirection mode, in
 
     ENSURE_( alsa_snd_pcm_hw_params_get_channels_min( hwParams, &minChans ), paUnanticipatedHostError );
     ENSURE_( alsa_snd_pcm_hw_params_get_channels_max( hwParams, &maxChans ), paUnanticipatedHostError );
+    /* ALSA may set maxChans to UINT_MAX if something is wrong.
+     * Our understanding is that if a plugin does not set maxChans then ALSA sets it to 10000,
+     * in which case we will clip to a lower value.
+     */
+    const unsigned int kBadMaxChannels = 20000;
     const unsigned int kReasonableMaxChannels = 1024;
-    if( maxChans > kReasonableMaxChannels )
+    if( maxChans > kBadMaxChannels )
     {
-        PA_DEBUG(( "%s: maxChans = %u, which is unreasonably high\n", __FUNCTION__, maxChans ));
+        PA_DEBUG(( "%s: maxChans = %u, which indicates an ERROR\n", __FUNCTION__, maxChans ));
         result = paUnanticipatedHostError;
         goto error;
+    }
+    else if( maxChans > kReasonableMaxChannels )
+    {
+        PA_DEBUG(( "%s: maxChans = %u, which is unreasonably high, force to %u\n",
+                __FUNCTION__, maxChans, kReasonableMaxChannels ));
+        maxChans = kReasonableMaxChannels;
     }
     else if( maxChans == 0 )
     {
@@ -1825,6 +1836,19 @@ static PaError TestParameters( const PaUtilHostApiRepresentation *hostApi, const
     /* Some specific hardware (reported: Audio8 DJ) can fail with assertion during this step. */
     ENSURE_( alsa_snd_pcm_hw_params_set_format( pcm, hwParams, Pa2AlsaFormat( hostFormat ) ), paUnanticipatedHostError );
 
+    /*
+     * Intel HDA driver doesn't set PCM rule to limit maximum size of buffer.
+     * This can result in a request for too large a buffer size.
+     * That can cause a memory allocation error in ALSA PCM core, at least it does in Linux kernel 5.8.
+     * As a workaround, limit buffer size to a reasonable value.
+     */
+    {
+        unsigned int bufferTimeMicros = 50 * 1000;
+        int direction = 0;
+        ENSURE_( alsa_snd_pcm_hw_params_set_buffer_time_near( pcm, hwParams,
+                &bufferTimeMicros, &direction ), paBufferTooBig );
+    }
+
     {
         /* It happens that this call fails because the device is busy */
         int ret = 0;
@@ -2003,6 +2027,7 @@ static PaError PaAlsaStreamComponent_InitialConfigure( PaAlsaStreamComponent *se
     int dir = 0;
     snd_pcm_t *pcm = self->pcm;
     unsigned int minPeriods = 2;
+    unsigned int requestedRate = *sampleRatePtr;
 
     /* self->framesPerPeriod = framesPerHostBuffer; */
 
@@ -2076,7 +2101,7 @@ static PaError PaAlsaStreamComponent_InitialConfigure( PaAlsaStreamComponent *se
         if( result == paInvalidSampleRate ) /* From the SetApproximateSampleRate() call above */
         { /* The sample rate was returned as 'out of tolerance' of the one requested */
             PA_DEBUG(( "%s: Wanted %.3f, closest sample rate was %u\n",
-                    __FUNCTION__, sampleRate, *sampleRatePtr ));
+                    __FUNCTION__, requestedRate, *sampleRatePtr ));
             PA_ENSURE( paInvalidSampleRate );
         }
     }
@@ -2784,7 +2809,7 @@ static PaError PaAlsaStream_Configure( PaAlsaStream *self, const PaStreamParamet
     {
         if (fabs(preciseCaptureSampleRate - precisePlaybackSampleRate) >= 1.0)
         {
-            PA_DEBUG(( "%s: Warning: input and output sample rates differ, %f != %f\n"
+            PA_DEBUG(( "%s: Warning: input and output sample rates differ, %f != %f\n",
                     __FUNCTION__, preciseCaptureSampleRate, precisePlaybackSampleRate ));
         }
     }
@@ -4458,17 +4483,17 @@ static void *CallbackThreadFunc( void *userData )
         }
     }
 
-end:
-    ; /* Hack to fix "label at end of compound statement" error caused by pthread_cleanup_pop(1) macro. */
-    /* Match pthread_cleanup_push */
-    pthread_cleanup_pop( 1 );
-
-    PA_DEBUG(( "%s: Thread %d exiting\n ", __FUNCTION__, pthread_self() ));
-    PaUnixThreading_EXIT( result );
-
+    /* Note that we will not fall into this error label from above.
+     * It is a while(1) loop that only exits using a goto.
+     */
 error:
     PA_DEBUG(( "%s: Thread %d is canceled due to error %d\n ", __FUNCTION__, pthread_self(), result ));
-    goto end;
+
+end:
+    PA_DEBUG(( "%s: Thread %d exiting\n ", __FUNCTION__, pthread_self() ));
+    /* Match pthread_cleanup_push */
+    pthread_cleanup_pop( 1 );
+    PaUnixThreading_EXIT( result );
 }
 
 /* Blocking interface */
